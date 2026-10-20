@@ -18,7 +18,7 @@ class Addition(BaseModel):
 
 @app.post("/api/add")
 def add(payload: Addition):
-    return {"a": payload.a, "b": payload.b, "resultat": payload.a + payload.b}
+    return {"c": payload.a + payload.b, "resultat": payload.c}
 
 @app.get("/api/network")
 def network():
