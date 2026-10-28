@@ -38,7 +38,7 @@ class PowerFlowSolver:
             Ybus[j, i] -= y_series / a
 
         # 2. Ajout des shunts des bus (Bsh)
-        # Correction : On ajoute +1j * Bsh pour correspondre au standard
+        # On ajoute +1j * Bsh pour correspondre au standard MATPOWER
         for i, b in enumerate(self.buses):
             if len(b) >= 7 and b[6] != 0:
                 Ybus[i, i] += 1j * float(b[6])

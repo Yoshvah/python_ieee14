@@ -17,8 +17,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # ============================================================
 class FactsConfig(BaseModel):
     bus_id: int
-    type: str          # "SVC", "TCSC", "UPFC"
-    param1: float      # SVC: B (pu) | TCSC: % Compensation | UPFC: P (MW)
+    type: str          # "SVC", "STATCOM", "TCSC", "UPFC"
+    param1: float      # SVC: B (pu) | STATCOM: Q (MVAr) | TCSC: % Comp | UPFC: P (MW)
     param2: float | None = None # UPFC: Q (MVAr)
 
 class SolarConfig(BaseModel):
@@ -44,7 +44,7 @@ def run_loadflow(data: NetworkData):
     try:
         modified_branches = [list(b) for b in data.branches]
         
-        # TCSC (modification de X)
+        # 1. TCSC (modification de X)
         for fact in data.facts:
             if fact.type == "TCSC":
                 for b in modified_branches:
@@ -54,29 +54,37 @@ def run_loadflow(data: NetworkData):
                         b[3] = x_initial * facteur
                         break 
 
+        # 2. Calcul de la matrice Ybus de base
         ids, ybus = calculate_ybus(data.buses, modified_branches, base_mva=100.0)
         
-        # SVC et UPFC
+        # 3. Application des dispositifs (SVC, STATCOM, UPFC)
         for fact in data.facts:
-            if fact.type in ["SVC", "STATCOM"]:
-                if fact.bus_id in ids:
-                    bus_idx = ids.index(fact.bus_id)
+            if fact.bus_id in ids:
+                bus_idx = ids.index(fact.bus_id)
+                
+                if fact.type == "SVC":
+                    # SVC : Modifie la matrice Ybus (admittance shunt +jB)
                     ybus = add_svc(ybus, bus_idx, fact.param1)
-            
-            elif fact.type == "UPFC":
-                if fact.bus_id in ids:
-                    bus_idx = ids.index(fact.bus_id)
+                
+                elif fact.type == "STATCOM":
+                    # STATCOM : Injecte Q dans le bilan de puissance (Q_spec)
+                    # Q_net = Q_spec - Q_calc. Injecter +Q revient à ajouter +Q à P_spec/Q_spec.
+                    # On ajoute Q_statcom (converti en p.u.) à la puissance réactive du bus.
+                    data.buses[bus_idx][3] += (fact.param1 / 100.0)
+                    
+                elif fact.type == "UPFC":
+                    # UPFC : Injecte P et Q au bus
                     data.buses[bus_idx][2] += (fact.param1 / 100.0)
                     if fact.param2 is not None:
                         data.buses[bus_idx][3] += (fact.param2 / 100.0)
 
-        # Panneaux Solaires
+        # 4. Panneaux Solaires (injection de P active)
         for solar in data.solars:
             if solar.bus_id in ids:
                 bus_idx = ids.index(solar.bus_id)
                 data.buses[bus_idx][2] += (solar.active_power / 100.0)
 
-        # Load Flow
+        # 5. Load Flow
         solver = PowerFlowSolver(100.0, data.buses, modified_branches)
         solver.Ybus = ybus 
         
@@ -85,7 +93,7 @@ def run_loadflow(data: NetworkData):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Le Load Flow n'a pas convergé : {str(e)}")
         
-        # Flux de branches
+        # 6. Flux de branches
         Va_rad = np.radians(Va)
         branch_flows = calculate_branch_flows(modified_branches, ids, Vm, Va_rad, 100.0)
         
@@ -101,6 +109,7 @@ def run_loadflow(data: NetworkData):
                 "loss_MW": round(float(np.real(f["loss_mva"])), 2),
             })
 
+        # 7. Formatage des résultats
         results = []
         for i in range(len(Vm)):
             results.append({
@@ -135,11 +144,12 @@ def run_stability(data: StabilityRequest):
     try:
         solver = PowerFlowSolver(100.0, data.buses, data.branches)
         
+        # Application des SVC pour l'état d'équilibre initial
         if data.facts:
             try:
                 ids, ybus = calculate_ybus(data.buses, data.branches)
                 for fact in data.facts:
-                    if fact.type in ["SVC", "STATCOM"] and fact.bus_id in ids:
+                    if fact.type == "SVC" and fact.bus_id in ids:
                         bus_idx = ids.index(fact.bus_id)
                         ybus = add_svc(ybus, bus_idx, fact.param1)
                 solver.Ybus = ybus
