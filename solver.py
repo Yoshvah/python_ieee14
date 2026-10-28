@@ -38,6 +38,7 @@ class PowerFlowSolver:
             Ybus[j, i] -= y_series / a
 
         # 2. Ajout des shunts des bus (Bsh)
+        # Correction : On ajoute +1j * Bsh pour correspondre au standard
         for i, b in enumerate(self.buses):
             if len(b) >= 7 and b[6] != 0:
                 Ybus[i, i] += 1j * float(b[6])
@@ -63,6 +64,9 @@ class PowerFlowSolver:
 
     def solve(self, tol=1e-8, max_iter=20):
         """Exécute Newton-Raphson et retourne (V, theta, P, Q, history)."""
+        # Réinitialisation de l'historique pour chaque nouveau calcul
+        self.history = []
+
         V = np.ones(self.nb_bus, dtype=complex)
         for i, b in enumerate(self.buses):
             V[i] = b[4] * np.exp(1j * np.radians(b[5]))
@@ -82,6 +86,7 @@ class PowerFlowSolver:
             "mismatch_max": None
         })
 
+        converged = False
         for iteration in range(1, max_iter + 1):
             V_mag = np.abs(V)
             V_ang = np.angle(V)
@@ -110,6 +115,7 @@ class PowerFlowSolver:
 
             if max_err < tol:
                 self.history[-1]["description"] = f"✅ Convergence atteinte à l'itération {iteration}"
+                converged = True
                 break
 
             # Jacobien
@@ -154,6 +160,9 @@ class PowerFlowSolver:
                 V_mag[i] += d_V[i_idx]
             
             V = V_mag * np.exp(1j * V_ang)
+
+        if not converged:
+            raise RuntimeError(f"Le Load Flow n'a pas convergé après {max_iter} itérations.")
 
         # Recalcul final
         V_mag = np.abs(V)
