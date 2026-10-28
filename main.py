@@ -4,40 +4,97 @@ from pydantic import BaseModel
 import numpy as np
 from solver import PowerFlowSolver
 
-# Importations de tes modules de calcul (vérifie bien les noms de dossiers)
+# Importations de tes modules de calcul
 from calculations.ybus import calculate_ybus
-from calculations.loadflow import newton_raphson
 from calculations.power_flows import calculate_branch_flows
 from calculations.dynamics import simulate_swing
-from calculations.disturbances import three_phase_fault_ybus
 from calculations.facts import add_svc
 
 app = FastAPI(title="SPARK-Flow Solver API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ============================================================
+# MODÈLES DE DONNÉES
+# ============================================================
+class FactsConfig(BaseModel):
+    bus_id: int
+    type: str          # "SVC", "TCSC", "UPFC"
+    param1: float      # SVC: B (pu) | TCSC: % Compensation | UPFC: P (MW)
+    param2: float | None = None # UPFC: Q (MVAr)
+
+class SolarConfig(BaseModel):
+    bus_id: int
+    active_power: float  # en MW
+
 class NetworkData(BaseModel):
     buses: list[list[float]]
     branches: list[list[float]]
+    facts: list[FactsConfig] = []     
+    solars: list[SolarConfig] = [] 
 
 class StabilityRequest(NetworkData):
     fault_bus: int
     fault_clear_time: float = 0.2
     duration: float = 5.0
 
+# ============================================================
+# ENDPOINT : LOAD FLOW
+# ============================================================
 @app.post("/api/loadflow")
 def run_loadflow(data: NetworkData):
     try:
-        # 1. CALCUL DE YBUS (Étape 1)
-        ids, ybus = calculate_ybus(data.buses, data.branches, base_mva=100.0)
+        # 1. Préparation des branches (Modification pour le TCSC)
+        modified_branches = [list(b) for b in data.branches]
         
-        # 2. LOAD FLOW (Étape 2)
-        solver = PowerFlowSolver(100.0, data.buses, data.branches)
-        Vm, Va, P, Q, history = solver.solve()
+        for fact in data.facts:
+            if fact.type == "TCSC":
+                # On cherche la première branche connectée à ce bus pour modifier son impédance
+                for b in modified_branches:
+                    if int(b[0]) == fact.bus_id or int(b[1]) == fact.bus_id:
+                        # param1 est le pourcentage de compensation (ex: 50 pour réduire X de 50%)
+                        x_initial = float(b[3])
+                        facteur = max(0.01, 1.0 - (fact.param1 / 100.0))
+                        b[3] = x_initial * facteur
+                        break # On ne modifie qu'une seule branche par TCSC
+
+        # 2. Calcul de Ybus avec les branches (potentiellement) modifiées
+        ids, ybus = calculate_ybus(data.buses, modified_branches, base_mva=100.0)
         
-        # 3. FLUX DE BRANCHES (Étape 3)
-        # Attention : Va du solver est en degrés, calculate_branch_flows attend des radians
+        # 3. Application des autres dispositifs
+        for fact in data.facts:
+            if fact.type in ["SVC", "STATCOM"]:
+                if fact.bus_id in ids:
+                    bus_idx = ids.index(fact.bus_id)
+                    # param1 = Susceptance B
+                    ybus = add_svc(ybus, bus_idx, fact.param1)
+            
+            elif fact.type == "UPFC":
+                if fact.bus_id in ids:
+                    bus_idx = ids.index(fact.bus_id)
+                    # Un UPFC injecte de la puissance active (P) et réactive (Q)
+                    data.buses[bus_idx][2] += (fact.param1 / 100.0)
+                    if fact.param2 is not None:
+                        data.buses[bus_idx][3] += (fact.param2 / 100.0)
+
+        # 4. Application des Panneaux Solaires
+        for solar in data.solars:
+            if solar.bus_id in ids:
+                bus_idx = ids.index(solar.bus_id)
+                # Le solaire injecte de la puissance active pure
+                data.buses[bus_idx][2] += (solar.active_power / 100.0)
+
+        # 5. Load Flow
+        solver = PowerFlowSolver(100.0, data.buses, modified_branches)
+        solver.Ybus = ybus 
+        
+        try:
+            Vm, Va, P, Q, history = solver.solve()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Le Load Flow n'a pas convergé (réseau instable) : {str(e)}")
+        
+        # 6. Calcul des flux de branches (avec les branches modifiées)
         Va_rad = np.radians(Va)
-        branch_flows = calculate_branch_flows(data.branches, ids, Vm, Va_rad, 100.0)
+        branch_flows = calculate_branch_flows(modified_branches, ids, Vm, Va_rad, 100.0)
         
         flows_formatted = []
         for f in branch_flows:
@@ -61,26 +118,41 @@ def run_loadflow(data: NetworkData):
                 "Q_MVAr": round(float(Q[i]), 2)
             })
         
-        # On renvoie TOUT au frontend
         return {
             "status": "Converged",
             "results": results,
-            "history": history,         # Le détail des itérations
-            "ybus": {                   # La matrice Ybus
+            "history": history,
+            "ybus": {
                 "ids": ids,
                 "real": np.round(ybus.real, 4).tolist(),
                 "imag": np.round(ybus.imag, 4).tolist(),
             },
-            "branch_flows": flows_formatted # Le détail des pertes par ligne
+            "branch_flows": flows_formatted,
         }
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================
+# ENDPOINT : STABILITÉ
+# ============================================================
 @app.post("/api/stability")
 def run_stability(data: StabilityRequest):
     try:
-        # 1. Load Flow initial pour l'état d'équilibre
         solver = PowerFlowSolver(100.0, data.buses, data.branches)
+        
+        # Application des SVC pour l'état initial
+        if data.facts:
+            try:
+                ids, ybus = calculate_ybus(data.buses, data.branches)
+                for fact in data.facts:
+                    if fact.type in ["SVC", "STATCOM"] and fact.bus_id in ids:
+                        bus_idx = ids.index(fact.bus_id)
+                        ybus = add_svc(ybus, bus_idx, fact.param1)
+                solver.Ybus = ybus
+            except: pass
+            
         Vm, Va, P, Q, _ = solver.solve()
         
         gen_buses = [b for b in data.buses if int(b[1]) in (2, 3)]
@@ -105,7 +177,7 @@ def run_stability(data: StabilityRequest):
         return {
             "time": res['time'].tolist(),
             "generators": [{"bus": gid, "delta": np.rad2deg(res['delta'][:, i]).tolist()} for i, gid in enumerate(gen_ids)],
-            "history": [{"time": round(t, 2), "angles": [round(np.rad2deg(d), 2) for d in deltas]} for t, deltas in zip(res['time'][::50], res['delta'][::50])] # Historique échantillonné toutes les 0.5s
+            "history": [{"time": round(t, 2), "angles": [round(np.rad2deg(d), 2) for d in deltas]} for t, deltas in zip(res['time'][::50], res['delta'][::50])]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
