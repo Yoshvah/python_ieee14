@@ -7,7 +7,7 @@ from solver import PowerFlowSolver
 from calculations.ybus import calculate_ybus
 from calculations.power_flows import calculate_branch_flows
 from calculations.dynamics import simulate_swing
-from calculations.facts import add_svc
+from calculations.facts import add_svc, add_statcom, add_tcsc, add_upfc
 
 app = FastAPI(title="SPARK-Flow Solver API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -16,14 +16,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # MODÈLES DE DONNÉES
 # ============================================================
 class FactsConfig(BaseModel):
-    bus_id: int
-    type: str          # "SVC", "STATCOM", "TCSC", "UPFC"
-    param1: float      # SVC: B (pu) | STATCOM: Q (MVAr) | TCSC: % Comp | UPFC: P (MW)
-    param2: float | None = None # UPFC: Q (MVAr)
+    bus_id: int | None = None       # Optionnel (SVC, STATCOM, UPFC)
+    branch_index: int | None = None # Optionnel (TCSC)
+    type: str          
+    param1: float      
+    param2: float | None = None
 
 class SolarConfig(BaseModel):
     bus_id: int
-    active_power: float  # en MW
+    active_power: float
 
 class NetworkData(BaseModel):
     buses: list[list[float]]
@@ -44,41 +45,35 @@ def run_loadflow(data: NetworkData):
     try:
         modified_branches = [list(b) for b in data.branches]
         
-        # 1. TCSC (modification de X)
+        # 1. TCSC (modification de X sur la ligne ciblée)
         for fact in data.facts:
-            if fact.type == "TCSC":
-                for b in modified_branches:
-                    if int(b[0]) == fact.bus_id or int(b[1]) == fact.bus_id:
-                        x_initial = float(b[3])
-                        facteur = max(0.01, 1.0 - (fact.param1 / 100.0))
-                        b[3] = x_initial * facteur
-                        break 
+            if fact.type == "TCSC" and fact.branch_index is not None:
+                idx = fact.branch_index
+                if 0 <= idx < len(modified_branches):
+                    modified_branches[idx] = add_tcsc(modified_branches[idx], fact.param1)
 
         # 2. Calcul de la matrice Ybus de base
         ids, ybus = calculate_ybus(data.buses, modified_branches, base_mva=100.0)
         
         # 3. Application des dispositifs (SVC, STATCOM, UPFC)
         for fact in data.facts:
-            if fact.bus_id in ids:
+            if fact.bus_id is not None and fact.bus_id in ids:
                 bus_idx = ids.index(fact.bus_id)
                 
                 if fact.type == "SVC":
-                    # SVC : Modifie la matrice Ybus (admittance shunt +jB)
                     ybus = add_svc(ybus, bus_idx, fact.param1)
                 
                 elif fact.type == "STATCOM":
-                    # STATCOM : Injecte Q dans le bilan de puissance (Q_spec)
-                    # Q_net = Q_spec - Q_calc. Injecter +Q revient à ajouter +Q à P_spec/Q_spec.
-                    # On ajoute Q_statcom (converti en p.u.) à la puissance réactive du bus.
-                    data.buses[bus_idx][3] += (fact.param1 / 100.0)
+                    q_inj = add_statcom(fact.param1 / 100.0)
+                    data.buses[bus_idx][3] += q_inj
                     
                 elif fact.type == "UPFC":
-                    # UPFC : Injecte P et Q au bus
+                    add_upfc(ybus, bus_idx, fact.param1 / 100.0, (fact.param2 or 0) / 100.0, 1.0)
                     data.buses[bus_idx][2] += (fact.param1 / 100.0)
                     if fact.param2 is not None:
                         data.buses[bus_idx][3] += (fact.param2 / 100.0)
 
-        # 4. Panneaux Solaires (injection de P active)
+        # 4. Panneaux Solaires
         for solar in data.solars:
             if solar.bus_id in ids:
                 bus_idx = ids.index(solar.bus_id)
@@ -144,7 +139,6 @@ def run_stability(data: StabilityRequest):
     try:
         solver = PowerFlowSolver(100.0, data.buses, data.branches)
         
-        # Application des SVC pour l'état d'équilibre initial
         if data.facts:
             try:
                 ids, ybus = calculate_ybus(data.buses, data.branches)
