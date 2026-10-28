@@ -4,7 +4,6 @@ from pydantic import BaseModel
 import numpy as np
 from solver import PowerFlowSolver
 
-# Importations de tes modules de calcul
 from calculations.ybus import calculate_ybus
 from calculations.power_flows import calculate_branch_flows
 from calculations.dynamics import simulate_swing
@@ -43,56 +42,50 @@ class StabilityRequest(NetworkData):
 @app.post("/api/loadflow")
 def run_loadflow(data: NetworkData):
     try:
-        # 1. Préparation des branches (Modification pour le TCSC)
         modified_branches = [list(b) for b in data.branches]
         
+        # TCSC (modification de X)
         for fact in data.facts:
             if fact.type == "TCSC":
-                # On cherche la première branche connectée à ce bus pour modifier son impédance
                 for b in modified_branches:
                     if int(b[0]) == fact.bus_id or int(b[1]) == fact.bus_id:
-                        # param1 est le pourcentage de compensation (ex: 50 pour réduire X de 50%)
                         x_initial = float(b[3])
                         facteur = max(0.01, 1.0 - (fact.param1 / 100.0))
                         b[3] = x_initial * facteur
-                        break # On ne modifie qu'une seule branche par TCSC
+                        break 
 
-        # 2. Calcul de Ybus avec les branches (potentiellement) modifiées
         ids, ybus = calculate_ybus(data.buses, modified_branches, base_mva=100.0)
         
-        # 3. Application des autres dispositifs
+        # SVC et UPFC
         for fact in data.facts:
             if fact.type in ["SVC", "STATCOM"]:
                 if fact.bus_id in ids:
                     bus_idx = ids.index(fact.bus_id)
-                    # param1 = Susceptance B
                     ybus = add_svc(ybus, bus_idx, fact.param1)
             
             elif fact.type == "UPFC":
                 if fact.bus_id in ids:
                     bus_idx = ids.index(fact.bus_id)
-                    # Un UPFC injecte de la puissance active (P) et réactive (Q)
                     data.buses[bus_idx][2] += (fact.param1 / 100.0)
                     if fact.param2 is not None:
                         data.buses[bus_idx][3] += (fact.param2 / 100.0)
 
-        # 4. Application des Panneaux Solaires
+        # Panneaux Solaires
         for solar in data.solars:
             if solar.bus_id in ids:
                 bus_idx = ids.index(solar.bus_id)
-                # Le solaire injecte de la puissance active pure
                 data.buses[bus_idx][2] += (solar.active_power / 100.0)
 
-        # 5. Load Flow
+        # Load Flow
         solver = PowerFlowSolver(100.0, data.buses, modified_branches)
         solver.Ybus = ybus 
         
         try:
             Vm, Va, P, Q, history = solver.solve()
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Le Load Flow n'a pas convergé (réseau instable) : {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Le Load Flow n'a pas convergé : {str(e)}")
         
-        # 6. Calcul des flux de branches (avec les branches modifiées)
+        # Flux de branches
         Va_rad = np.radians(Va)
         branch_flows = calculate_branch_flows(modified_branches, ids, Vm, Va_rad, 100.0)
         
@@ -142,7 +135,6 @@ def run_stability(data: StabilityRequest):
     try:
         solver = PowerFlowSolver(100.0, data.buses, data.branches)
         
-        # Application des SVC pour l'état initial
         if data.facts:
             try:
                 ids, ybus = calculate_ybus(data.buses, data.branches)

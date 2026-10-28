@@ -7,35 +7,53 @@ class PowerFlowSolver:
         self.branches = branches
         self.nb_bus = len(buses)
         self.bus_map = {int(b[0]): i for i, b in enumerate(buses)}
-        self.history = []  # Stocke l'historique pour l'affichage des étapes
+        self.history = []
         self.Ybus = self._build_ybus()
         self.P_spec, self.Q_spec = self._get_specifications()
 
     def _build_ybus(self):
-        """Construit la matrice d'admittance Y-bus à partir des branches."""
+        """Construit la matrice d'admittance Ybus complète."""
         Ybus = np.zeros((self.nb_bus, self.nb_bus), dtype=complex)
+        
+        # 1. Ajout des lignes et transformateurs
         for br in self.branches:
-            f, t, r, x = int(br[0]), int(br[1]), br[2], br[3]
+            f, t = int(br[0]), int(br[1])
+            r, x = float(br[2]), float(br[3])
+            b = float(br[4]) if len(br) > 4 else 0.0
+            tap = float(br[5]) if len(br) > 5 else 0.0
+            
             if r == 0 and x == 0:
                 continue
-            y = 1 / complex(r, x)
+                
+            y_series = 1 / complex(r, x)
+            y_shunt_line = 1j * b / 2.0
+            a = 1.0 if tap == 0 else tap
+            
             i, j = self.bus_map[f], self.bus_map[t]
-            Ybus[i, i] += y
-            Ybus[j, j] += y
-            Ybus[i, j] -= y
-            Ybus[j, i] -= y
+            
+            # Modèle Pi
+            Ybus[i, i] += (y_series + y_shunt_line) / (a**2)
+            Ybus[j, j] += y_series + y_shunt_line
+            Ybus[i, j] -= y_series / a
+            Ybus[j, i] -= y_series / a
+
+        # 2. Ajout des shunts des bus (Bsh)
+        for i, b in enumerate(self.buses):
+            if len(b) >= 7 and b[6] != 0:
+                Ybus[i, i] += 1j * float(b[6])
+                
         return Ybus
 
     def _get_specifications(self):
-        """Extrait les puissances spécifiées (P et Q) selon le type de bus."""
+        """Prépare les vecteurs P_spec et Q_spec."""
         P_spec = np.zeros(self.nb_bus)
         Q_spec = np.zeros(self.nb_bus)
         for i, b in enumerate(self.buses):
             type_bus = int(b[1])
-            if type_bus == 1:   # PQ (charge)
+            if type_bus == 1:   # PQ
                 P_spec[i] = b[2]
                 Q_spec[i] = b[3]
-            elif type_bus == 2: # PV (générateur)
+            elif type_bus == 2: # PV
                 P_spec[i] = b[2]
                 Q_spec[i] = 0.0
             else:               # Slack
@@ -43,7 +61,7 @@ class PowerFlowSolver:
                 Q_spec[i] = 0.0
         return P_spec, Q_spec
 
-    def solve(self, tol=1e-6, max_iter=20):
+    def solve(self, tol=1e-8, max_iter=20):
         """Exécute Newton-Raphson et retourne (V, theta, P, Q, history)."""
         V = np.ones(self.nb_bus, dtype=complex)
         for i, b in enumerate(self.buses):
@@ -56,10 +74,9 @@ class PowerFlowSolver:
         angle_idx = pq_idx + pv_idx
         V_idx = pq_idx
 
-        # --- ÉTAPE 0 : État initial ---
         self.history.append({
             "iteration": 0,
-            "description": "État initial (estimations)",
+            "description": "État initial",
             "V": np.abs(V).round(4).tolist(),
             "theta": np.degrees(np.angle(V)).round(2).tolist(),
             "mismatch_max": None
@@ -71,35 +88,31 @@ class PowerFlowSolver:
             P_calc = np.zeros(self.nb_bus)
             Q_calc = np.zeros(self.nb_bus)
             
-            # Calcul des puissances injectées
             for i in range(self.nb_bus):
                 for j in range(self.nb_bus):
                     P_calc[i] += V_mag[i] * V_mag[j] * (self.Ybus[i, j].real * np.cos(V_ang[i] - V_ang[j]) + self.Ybus[i, j].imag * np.sin(V_ang[i] - V_ang[j]))
                     Q_calc[i] += V_mag[i] * V_mag[j] * (self.Ybus[i, j].real * np.sin(V_ang[i] - V_ang[j]) - self.Ybus[i, j].imag * np.cos(V_ang[i] - V_ang[j]))
 
-            # Calcul des erreurs (mismatch)
             dP = self.P_spec - P_calc
             dQ = self.Q_spec - Q_calc
             mismatch = np.concatenate((dP[angle_idx], dQ[V_idx]))
             max_err = float(np.max(np.abs(mismatch))) if len(mismatch) > 0 else 0.0
             
-            # Enregistrement de l'itération (avec V et theta à chaque étape)
             self.history.append({
                 "iteration": iteration,
-                "description": f"Itération {iteration} - Calcul des puissances et Jacobien",
+                "description": f"Itération {iteration}",
                 "V": V_mag.round(4).tolist(),
                 "theta": np.degrees(V_ang).round(2).tolist(),
                 "P_calc": (P_calc * self.base_mva).round(2).tolist(),
                 "Q_calc": (Q_calc * self.base_mva).round(2).tolist(),
-                "mismatch_max": round(max_err, 6)
+                "mismatch_max": round(max_err, 8)
             })
 
-            # Critère de convergence
             if max_err < tol:
                 self.history[-1]["description"] = f"✅ Convergence atteinte à l'itération {iteration}"
                 break
 
-            # --- Construction du Jacobien ---
+            # Jacobien
             J11 = np.zeros((len(angle_idx), len(angle_idx)))
             J12 = np.zeros((len(angle_idx), len(V_idx)))
             J21 = np.zeros((len(V_idx), len(angle_idx)))
@@ -129,14 +142,12 @@ class PowerFlowSolver:
                     else:
                         J22[i_idx, j_idx] = V_mag[i] * (self.Ybus[i, j].real * np.sin(V_ang[i] - V_ang[j]) - self.Ybus[i, j].imag * np.cos(V_ang[i] - V_ang[j]))
 
-            # Résolution du système linéaire J * dx = mismatch
             J = np.block([[J11, J12], [J21, J22]])
             dx = np.linalg.solve(J, mismatch)
             
             d_theta = dx[:len(angle_idx)]
             d_V = dx[len(angle_idx):]
             
-            # Mise à jour des variables
             for i_idx, i in enumerate(angle_idx):
                 V_ang[i] += d_theta[i_idx]
             for i_idx, i in enumerate(V_idx):
@@ -144,7 +155,9 @@ class PowerFlowSolver:
             
             V = V_mag * np.exp(1j * V_ang)
 
-        # Calcul final des puissances (après convergence)
+        # Recalcul final
+        V_mag = np.abs(V)
+        V_ang = np.angle(V)
         P_final = np.zeros(self.nb_bus)
         Q_final = np.zeros(self.nb_bus)
         for i in range(self.nb_bus):

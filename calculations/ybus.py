@@ -57,7 +57,7 @@ def calculate_ybus(buses, branches, base_mva=100.0):
     # convertissant à l'aide de la puissance de base.
     for row in buses:
         if len(row) >= 7:
-            y[index[int(row[0])], index[int(row[0])]] += 1j * float(row[6]) / base_mva
+            y[index[int(row[0])], index[int(row[0])]] -= 1j * float(row[6]) / base_mva
 
     # Renvoie les identifiants dans l'ordre utilisé par la matrice, puis Ybus.
     return ids, y
